@@ -167,153 +167,201 @@ def reverse_diffusion(
     return x_tm1, x_0_pred  # 回傳下個 step 的 x, 以及這一步預測的 x_0
 
 
-@torch.inference_mode()
+@torch.inference_mode()  # 關掉 autograd，推論時不用算梯度
 def perform_simple_inference(
-    model: TransFusion, cond_emb: Tensor, diff: MultinomialDiffusion, vocab, cfg
+    model: TransFusion,  # TransFusion 多分類 diffusion ASR 模型
+    cond_emb: Tensor,  # 條件嵌入（通常是聲音的特徵向量）
+    diff: MultinomialDiffusion,  # multinomial 擴散模型（負責 forward/reverse/sample）
+    vocab,  # 詞彙表，用來還原成文字
+    cfg,  # 模型及推論設定
 ):
-    device = cond_emb.device
-    dtype = torch.float32
-    bs = cond_emb.shape[0]
+    device = cond_emb.device  # 取得特徵所在裝置
+    dtype = torch.float32  # 預設 float32 精度
+    bs = cond_emb.shape[0]  # 取得 batch 大小
+
+    # 隨機初始化一組 token 做為 diffusion 過程的起始狀態（每個 batch、每個時間步都是亂數）
     x = torch.randint(
-        0,
-        diff.num_classes,
-        (cond_emb.shape[0], DSH.T_override),
-        dtype=torch.long,
-        device=cond_emb.device,
+        0,  # 最小值
+        diff.num_classes,  # 最大值（詞彙表大小）
+        (cond_emb.shape[0], DSH.T_override),  # 形狀：(batch, 序列長度)
+        dtype=torch.long,  # 使用 long 型別
+        device=cond_emb.device,  # 指定裝置
     )
+
+    # 條件嵌入放到對應裝置上
     cond_emb = cond_emb.to(device, non_blocking=True)
+    # 建立 padding mask，預設不遮蔽（全為 False）
     cond_padding_mask = torch.zeros_like(cond_emb, dtype=torch.bool)[..., 0]
+    # padding mask 也搬到對應裝置
     cond_padding_mask = cond_padding_mask.to(device, non_blocking=True)
+    # 條件特徵轉成 float32（防止型別不一致）
     cond_emb = cond_emb.to(dtype)
 
-    # RePaint paper resample scheduling
+    # 依照 RePaint 論文的方式，生成 diffusion 過程要經過的時間點（時間排程）
     times = get_schedule(cfg.T, jump_n_sample=DSH.jump_n_sample, jump_len=DSH.jump_len)
 
+    # 全部設為未知區域（inpainting 用，但這裡都設 0）
     x_known = torch.zeros_like(x)
-    m = torch.zeros_like(x).bool()
+    m = torch.zeros_like(x).bool()  # mask 也全設 False
 
-    c = 0  # sequentially progressive diffusion offset (Section 4.2)
+    c = 0  # progressive diffusion offset，用來調整跳躍的步伐
 
-    # ensemble bs (not in paper)
+    # ensemble alpha 參數，支援多模型分布混合（這裡設為線性遞減）
     alphas = torch.linspace(1, 0, cfg.T).to(device)
 
-    # See RePaint paper algorithm
+    # 用進度條跑迴圈，遍歷每個排程中的時間點（決定每步是 forward 還是 reverse）
     for t_last, t_cur in progress_bar(zip(times[:-1], times[1:]), total=len(times) - 1):
 
+        # 每一個 batch 全部設為相同時間步 t
         t = torch.ones((bs,), dtype=torch.long, device=x.device) * (t_last)
+        # 判斷這一步是要做 reverse（去雜訊）還是 forward（加雜訊）
         if t_cur < t_last:
+            # 如果 jump 次數超過上限就歸零
             if c > DSH.jump_n_sample:
                 c = 0
+            # 否則逐步累加 offset
             c += 1 / DSH.jump_len
 
-            # Reverse diffusion: q
+            # 準備 batch 輸入格式，包含 x, t, 條件特徵、padding mask 及其他必要資訊
             xx = (x, t, cond_emb, cond_padding_mask, None)
+            # 執行 reverse diffusion，將 x_t 推回 x_{t-1}
             x, x_0_pred = reverse_diffusion(
-                diff,
-                model,
-                xx,
-                x_known,
-                m,
-                temperature=DSH.x_0_temp,
-                alphas=alphas,
-                ensemble_size=1,
+                diff,  # diffusion 物件
+                model,  # TransFusion 模型
+                xx,  # 當前 batch（包含 x, t, 條件等）
+                x_known,  # inpainting 用的已知區域（這裡全未知）
+                m,  # mask
+                temperature=DSH.x_0_temp,  # 溫度參數，調整生成平滑度
+                alphas=alphas,  # ensemble 混合參數
+                ensemble_size=1,  # ensemble 個數（這裡只用一個）
             )
         else:
-            # Forward diffusion: p
+            # 做 forward diffusion，將 x_{t-1} 加雜訊變 x_t
             if DSH.enable_kevin_scaled_inference:
+                # 支援特殊推論模式（會根據 c 調整加雜訊方式）
                 x = forward_diffusion(cfg, diff, dtype, x, t, c=c)
             else:
+                # 標準 forward diffusion
                 x = forward_diffusion(cfg, diff, dtype, x, t, c=None)
 
+    # diffusion 完所有時間步後，把 batch 裡每組 token 編碼轉成文字
     text_preds = [to_text(p, vocab["i2s"]) for p in x]
+    # 回傳最終的 token（數字標籤）以及對應的文字結果
     return x, text_preds
 
 
 # ------------------
-# torch hub integration functions
+# torch hub 整合用的函式
 
 
 def transfusion_small_462k(
-    pretrained=True, progress=True, device="cuda"
+    pretrained=True,  # 是否載入預訓練權重
+    progress=True,  # 顯示下載進度
+    device="cuda",  # 指定裝置，預設用 GPU
 ) -> TransFusion:
-    """Best TransFusion model described in the paper, ~250M parameters and trained for
-    462 000 updates. A multinomial diffusion ASR model transcribing utterances from their WavLM embeddings.
     """
+    載入論文裡最佳的 TransFusion-small 模型（約 2.5 億參數，訓練 462,000 次）
+    這是一個 multinomial diffusion ASR 模型，用來從 WavLM 特徵做語音轉文字
+    """
+
+    # 如果沒有 GPU，強制使用 CPU 避免報錯
     if torch.cuda.is_available() == False:
         if str(device) != "cpu":
             logging.warning(
                 f"Overriding device {device} to cpu since no GPU is available."
             )
             device = "cpu"
-    # load checkpoints
+
+    # 下載並載入模型權重（PyTorch Hub 標準方式）
     ckpt = torch.hub.load_state_dict_from_url(
         "https://github.com/RF5/transfusion-asr/releases/download/v1.0/transfusion_462k_slim.pt",
-        map_location=device,
-        progress=progress,
+        map_location=device,  # 自動搬到指定 device
+        progress=progress,  # 是否顯示下載進度
     )
 
+    # 重新定義 device，確保 torch.device 類型
     device = torch.device(device)
+
+    # 下載並載入 vocab（index to string 映射表，存在 pt 檔裡）
     vocab = torch.hub.load_state_dict_from_url(
         "https://github.com/RF5/transfusion-asr/releases/download/v1.0/transfusion-vocab.pt",
         map_location="cpu",
         progress=progress,
     )
 
-    # load config
+    # 解析模型組態設定（OmegaConf 是 Yaml 管理包）
     cfg = OmegaConf.structured(ckpt["cfg_yaml"])
     logging.debug(f"CKPT CONFIG:\n{OmegaConf.to_yaml(cfg)}")
     logging.debug(
         f"Default diffusion sampling hyperparameters:\n{OmegaConf.to_yaml(OmegaConf.create(DSH))}"
     )
 
-    # load model
+    # 建立 TransFusion 模型主體，載入設定檔與最大輸出長度
     model = TransFusion(cfg.model_cfg, cfg.max_transcript_length).to(device)
+    # 如果指定要載入預訓練參數
     if pretrained:
-        model.load_state_dict(ckpt["module"])
+        model.load_state_dict(ckpt["module"])  # 載入模型參數
+    # 切換到 eval 模式（停用 dropout 等訓練專用元件）
     model.eval()
     print(
         f"TransFusion-small 462k update model loaded with {sum([p.numel() for p in model.parameters()]):,d} parameters."
     )
 
-    # create diffusion
+    # 建立 diffusion 運算器（負責 forward/reverse/sample）
     diffuser = MultinomialDiffusion(
-        cfg.model_cfg.vocab_size,
-        cfg.model_cfg.T,
-        cfg.model_cfg.diffusion_s,
-        device=device,
+        cfg.model_cfg.vocab_size,  # 詞彙表大小
+        cfg.model_cfg.T,  # diffusion 步數
+        cfg.model_cfg.diffusion_s,  # schedule 參數
+        device=device,  # 裝置
     )
 
+    # 綁定 vocab、diffuser、推論 function 到 model 上，方便直接呼叫
     model.vocab = vocab
     model.diffuser = diffuser
     model.perform_simple_inference = perform_simple_inference
     model.forward_diffusion = forward_diffusion
     model.reverse_diffusion = reverse_diffusion
+
+    # 回傳完整模型
     return model
 
 
 def wavlm_large(pretrained=True, progress=True, device="cuda") -> WavLM:
-    """Load the WavLM large checkpoint from the original paper."""
+    """
+    載入原始論文釋出的 WavLM-Large 預訓練權重
+    """
+    # 如果沒有 GPU，強制切換到 CPU
     if torch.cuda.is_available() == False:
         if str(device) != "cpu":
             logging.warning(
                 f"Overriding device {device} to cpu since no GPU is available."
             )
             device = "cpu"
+    # 從網路下載 WavLM-Large 的權重檔案
     checkpoint = torch.hub.load_state_dict_from_url(
         "https://github.com/RF5/transfusion-asr/releases/download/v1.0/WavLM-Large.pt",
-        map_location=device,
-        progress=progress,
+        map_location=device,  # 直接載入到指定裝置（GPU 或 CPU）
+        progress=progress,  # 是否顯示下載進度
     )
 
+    # 解析設定檔，建立 WavLMConfig 物件（管理模型所有超參數）
     cfg = WavLMConfig(checkpoint["cfg"])
+    # 轉換 device 物件型別（PyTorch 要求這樣寫才標準）
     device = torch.device(device)
+    # 建立 WavLM 主體
     model = WavLM(cfg)
+    # 如果指定載入預訓練權重
     if pretrained:
         model.load_state_dict(checkpoint["model"])
+    # 把模型搬到對應 device（GPU 或 CPU）
     model = model.to(device)
+    # 切換為 eval 模式，停用 dropout/batchnorm 的訓練行為
     model.eval()
+    # 給 model 增加 extract_transfusion_features 方法，方便直接萃取 transfusion 特徵
     model.extract_transfusion_features = extract_transfusion_features
+    # 印出模型參數量
     print(
         f"WavLM-Large loaded with {sum([p.numel() for p in model.parameters()]):,d} parameters"
     )
+    # 回傳已經準備好的模型
     return model

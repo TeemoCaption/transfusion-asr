@@ -1,4 +1,3 @@
-
 import pandas as pd
 from pathlib import Path
 from fastprogress.fastprogress import progress_bar
@@ -7,47 +6,76 @@ import os
 import argparse
 import torch
 
-THIS_DIR = Path(__file__).parent
+THIS_DIR = Path(__file__).parent  # 取得目前檔案所在的資料夾
 
 
 def make_librispeech_df(root_path: Path) -> pd.DataFrame:
+    # 建立 LibriSpeech 所有資料檔案的 DataFrame
     all_files = []
-    folders = ['train-clean-100', 'train-clean-360', 'train-other-500', 'dev-clean', 'dev-other', 'test-clean', 'test-other']
+    folders = [
+        "train-clean-100",
+        "train-clean-360",
+        "train-other-500",
+        "dev-clean",
+        "dev-other",
+        "test-clean",
+        "test-other",
+    ]  # LibriSpeech 常見的七大子資料夾
     for f in folders:
-        all_files.extend(list((root_path/f).rglob('**/*.flac')))
-    speakers = ['ls-' + f.stem.split('-')[0] for f in all_files]
+        # 遍歷所有 flac 檔案路徑
+        all_files.extend(list((root_path / f).rglob("**/*.flac")))
+    # 取得 speaker ID（ls-加上說話者編號）
+    speakers = ["ls-" + f.stem.split("-")[0] for f in all_files]
+    # 取得每個檔案屬於哪個 subset
     subset = [f.parents[2].stem for f in all_files]
-    df = pd.DataFrame({'path': all_files, 'speaker': speakers, 'subset': subset})
+    # 建成一個 DataFrame，包含檔案路徑、speaker、subset
+    df = pd.DataFrame({"path": all_files, "speaker": speakers, "subset": subset})
     return df
+
 
 def get_transcriptions(df: pd.DataFrame) -> pd.DataFrame:
-    transcripts = {}
-    out_transcripts = []
+    # 根據 DataFrame 路徑，自動抓取每個音檔對應的文字標註（transcription）
+    transcripts = {}  # 暫存已經讀過的 transcription
+    out_transcripts = []  # 最後要寫進 DataFrame 的 transcription
+    # 用 progress_bar 包起來，顯示進度條
     for i, row in progress_bar(df.iterrows(), total=len(df)):
-        p = Path(row.path)
+        p = Path(row.path)  # 取得當前 row 的路徑物件
         if p.stem in transcripts:
+            # 如果之前已經讀過這個音檔的標註，直接拿出來
             out_transcripts.append(transcripts[p.stem])
         else:
-
-            with open(p.parent/f'{p.parents[1].stem}-{p.parents[0].stem}.trans.txt', 'r') as file:
+            # 找出當前資料夾下對應的 .trans.txt（存所有句子的 transcription）
+            with open(
+                p.parent / f"{p.parents[1].stem}-{p.parents[0].stem}.trans.txt", "r"
+            ) as file:
                 lines = file.readlines()
                 for l in lines:
-                    uttr_id, transcrip = l.split(' ', maxsplit=1)
+                    # 逐行解析，uttr_id = 音檔 stem，transcrip = 句子
+                    uttr_id, transcrip = l.split(" ", maxsplit=1)
                     transcripts[uttr_id] = transcrip.strip()
+            # 再把當前這個音檔的 transcription 加進 list
             out_transcripts.append(transcripts[p.stem])
-    df['transcription'] = out_transcripts
+    # 新增 transcription 欄位到 DataFrame
+    df["transcription"] = out_transcripts
     return df
 
+
 def get_wavlm_feat_paths(df: pd.DataFrame, ls_path, wavlm_path) -> pd.DataFrame:
+    # 幫每個音檔路徑，找出對應預存的 WavLM 特徵檔（.pt）
     pb = progress_bar(df.iterrows(), total=len(df))
     targ_paths = []
     for i, row in pb:
-        rel_path = Path(row.path).relative_to(ls_path)
-        targ_path = (wavlm_path/rel_path).with_suffix('.pt')
-        assert targ_path.is_file()
-        targ_paths.append(targ_path)
-    df['wavlm_path'] = targ_paths
+        rel_path = Path(row.path).relative_to(
+            ls_path
+        )  # 計算音檔路徑相對於原始資料夾的路徑
+        targ_path = (wavlm_path / rel_path).with_suffix(
+            ".pt"
+        )  # 換成目標資料夾、附檔名改 .pt
+        assert targ_path.is_file()  # 檢查檔案真的存在
+        targ_paths.append(targ_path)  # 加進 list
+    df["wavlm_path"] = targ_paths  # 新增到 DataFrame
     return df
+
 
 def get_vocab(df: pd.DataFrame, eps_idx=0):
     vocab = set(('eps',))
