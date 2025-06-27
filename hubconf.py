@@ -79,10 +79,10 @@ def forward_diffusion(cfg, diff, dtype, x, t, c=None):
     - c: 進階用途，給 sequential progressive diffusion offset
     """
 
-    # 1. 先把離散的 x 轉成 one-hot（其實這裡是 log-one-hot 向量）
+    # 把離散的 x 轉成 one-hot
     log_x_t = index_to_log_onehot(x, cfg.vocab_size, dtype=dtype)
 
-    # 2. 根據有沒有提供 c，選用不同版本的 forward 擴散方法
+    # 根據有沒有提供 c，選用不同版本的 forward 擴散方法
     if c is not None:
         # c 主要用於特殊進階推論（像 RePaint/repainting），加強/調整 diffusion 步驟
         x = diff.q_pred_one_timestep_scaled(log_x_t, t, c, DSH.jump_len)
@@ -90,7 +90,7 @@ def forward_diffusion(cfg, diff, dtype, x, t, c=None):
         # 標準的 forward diffusion（q）步驟
         x = diff.q_pred_one_timestep(log_x_t, t)
 
-    # 3. 在 log space 做完運算後，實際 sample 一個新的 token（隨機取樣）
+    # 在 log space 做完運算後，實際 sample 一個新的 token（隨機取樣）
     x = diff.log_sample_categorical(x)
     return x  # 回傳當前步驟擴散後的新 label（token）
 
@@ -99,59 +99,72 @@ def reverse_diffusion(
     diff,
     model,
     batch,
-    x_known=None,
-    m=None,
-    last_greedy=False,
-    temperature=1.0,
-    alphas=None,
-    ensemble_size=1,
+    x_known=None,  # 已知的部分（如 inpainting 問題的已知區域）
+    m=None,  # mask，1 代表已知、0 代表未知
+    last_greedy=False,  # t=0 時是否用 argmax（確定性）而不是 sample
+    temperature=1.0,  # 調整模型預測分布的平滑度（越大越均勻）
+    alphas=None,  # ensemble 用的 alpha 列表
+    ensemble_size=1,  # ensemble 次數
 ):
-    """Reverse diffusion process q: predict x_{t-1} given x, t, x_known, m. Optionally do not sample model output
-    for t=0, but rather use the greedy argmax with `last_greedy`.
     """
-    x = batch[0]
-    t = batch[1]
+    反向擴散過程 q：根據目前 x, t, x_known, m 等資訊，預測 x_{t-1}
+    支援 mask（inpainting）、溫度、ensemble 以及最後一層用 argmax。
+    """
+    x = batch[0]  # 當前 step 的預測 x_t
+    t = batch[1]  # 當前時間步 t
     if x_known is None:
-        x_known = torch.zeros_like(x)
+        x_known = torch.zeros_like(x)  # 如果沒給已知，預設全部未知
     if m is None:
-        m = torch.zeros_like(x)
+        m = torch.zeros_like(x)  # 如果沒給 mask，預設全部未知
 
-    # Equation 8b
-    x_0_pred = model(*batch)
+    # 預測 x_0（乾淨資料）
+    # 將 batch 所有資訊餵給模型（通常含條件、padding mask等）
+    x_0_pred = model(*batch)  # Equation 8b in論文
 
+    # Guidance (條件引導)
+    # 若 guidance_w < 1，混合有條件/無條件預測，做 conditional/unconditional 混合推論
     if DSH.guidance_w != 1:
         uncond_x_0_pred = model(
             x, t, torch.zeros_like(batch[2]), torch.ones_like(batch[3]), batch[-1]
         )
+        # guidance_w=1 只用條件，<1 則混合兩種
         x_0_pred = DSH.guidance_w * x_0_pred + (1 - DSH.guidance_w) * uncond_x_0_pred
 
+    # 溫度縮放（控制預測分布的平滑度）
     x_0_pred = x_0_pred / temperature
+    # softmax 得到 log 機率分布
     log_x_0_pred = F.log_softmax(x_0_pred, dim=-1)
+    # 把 x 轉成 log-onehot
     log_x_t = index_to_log_onehot(x, diff.num_classes, dtype=x_0_pred.dtype)
-    log_model_pred = diff.p_pred(log_x_t, t, log_x_0_pred)  # p(x_{t-1} | x_{t})
+    # 用 diffusion 模型還原 p(x_{t-1}|x_t) 的 log 機率分布
+    log_model_pred = diff.p_pred(log_x_t, t, log_x_0_pred)  # 論文 Equation 8b
 
+    # Ensemble trick（多模型混合推論，提升穩定性
     a_t = alphas[t[0]] if alphas is not None else 0
     mat = torch.eye(ensemble_size, device=x.device) * (1 - a_t)
     mat += 1 / ensemble_size * a_t
     mat = torch.block_diag(*([mat] * (x.shape[0] // ensemble_size)))
+    # log_model_pred shape: (batch, ..., vocab)
     log_model_pred = (mat[..., None, None]).log().to(x.dtype) + log_model_pred[None]
+    # 對 ensemble 維度做 logsumexp，合併多個模型分布
     log_model_pred = torch.logsumexp(log_model_pred, dim=1)
 
-    if (t == 0).all() and last_greedy:  # Do not sample at t=0
+    # 依據時間步做 sample 或 argmax
+    if (t == 0).all() and last_greedy:  # t=0（最後一層）用 argmax
         x_tm1_unknown = log_model_pred.argmax(dim=-1)
-    else:
+    else:  # 其它情況都用抽樣
         x_tm1_unknown = diff.log_sample_categorical(log_model_pred)
 
-    # Equation 8a
+    # 有 mask（inpainting 問題）時處理已知區域
     x_known_log = index_to_log_onehot(x_known, diff.num_classes, dtype=x_0_pred.dtype)
-    if (t == 0).all():  # Do not sample at t=0
+    if (t == 0).all():  # t=0 時直接還原
         x_tm1_known = x_known
     else:
         x_tm1_known = diff.q_sample(x_known_log, t)
 
-    # Equation 8c
+    # 最終組合已知/未知區域
     x_tm1 = x_tm1_known * m.long() + x_tm1_unknown * (1 - m.long())
-    return x_tm1, x_0_pred
+    return x_tm1, x_0_pred  # 回傳下個 step 的 x, 以及這一步預測的 x_0
 
 
 @torch.inference_mode()
